@@ -51,7 +51,7 @@ jobs:
 
       # Generates android/ (since your repo is managed Expo)
       - name: Expo prebuild (Android)
-        run: CI=1 npx expo prebuild --platform android --clean
+        run: CI=1 npx expo prebuild --platform android --clean --skip-dependency-update expo,react-native,react --no-install --npm
 
       # Put the keystore where we'll reference it from credentials.json
       - name: Decode keystore
