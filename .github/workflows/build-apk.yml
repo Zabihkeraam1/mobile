@@ -1,0 +1,114 @@
+name: Android Build (Local) -> S3 Presigned URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      expires_seconds:
+        description: "Presigned URL expiry (max 604800 = 7 days)"
+        required: false
+        default: "604800"
+
+jobs:
+  build_upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Install JS deps
+        run: npm ci
+
+      # Generates android/ folder (Expo prebuild)
+      - name: Expo prebuild (Android)
+        run: npx expo prebuild --platform android --non-interactive
+
+      # Recreate keystore file from secret
+      - name: Decode Android keystore
+        shell: bash
+        run: |
+          mkdir -p android/app
+          printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > android/app/upload-keystore.jks
+          ls -la android/app/upload-keystore.jks
+
+      # Inject signing values into gradle.properties (no secrets committed)
+      - name: Write signing props
+        shell: bash
+        run: |
+          {
+            echo "MYAPP_UPLOAD_STORE_FILE=upload-keystore.jks"
+            echo "MYAPP_UPLOAD_STORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+            echo "MYAPP_UPLOAD_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}"
+            echo "MYAPP_UPLOAD_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}"
+          } >> android/gradle.properties
+
+      # Build a directly installable APK
+      - name: Build signed APK (Release)
+        shell: bash
+        run: |
+          cd android
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Locate APK
+        id: apk
+        shell: bash
+        run: |
+          APK_PATH="$(ls -1 app/build/outputs/apk/release/*release*.apk | head -n 1)"
+          echo "apk_path=android/${APK_PATH}" >> $GITHUB_OUTPUT
+          echo "Found APK: android/${APK_PATH}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Upload to private S3 and create presigned URL
+        shell: bash
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          # Optional: customize the key layout per customer/app/version
+          KEY="mobile-builds/${{ github.repository }}/${{ github.run_id }}/app-release.apk"
+
+          aws s3 cp "${{ steps.apk.outputs.apk_path }}" "s3://${S3_BUCKET}/${KEY}" \
+            --content-type "application/vnd.android.package-archive"
+
+          # Presigned URL (AWS CLI max is 7 days = 604800 seconds)
+          EXPIRES="${{ inputs.expires_seconds }}"
+          if [ "$EXPIRES" -gt 604800 ]; then EXPIRES=604800; fi
+
+          URL="$(aws s3 presign "s3://${S3_BUCKET}/${KEY}" --expires-in "${EXPIRES}")"
+
+          echo "✅ Uploaded: s3://${S3_BUCKET}/${KEY}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 Download (presigned):" >> $GITHUB_STEP_SUMMARY
+          echo "${URL}" >> $GITHUB_STEP_SUMMARY
