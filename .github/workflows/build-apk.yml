@@ -1,16 +1,18 @@
-name: Android Build (Local) -> S3 Presigned URL
+name: Build Android APK -> S3 (Presigned URL)
 
 on:
   workflow_dispatch:
     inputs:
-      expires_seconds:
-        description: "Presigned URL expiry (max 604800 = 7 days)"
+      expires_in:
+        description: "Presigned URL expiry in seconds (max 604800 = 7 days)"
         required: false
         default: "604800"
 
 jobs:
-  build_upload:
+  android_apk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -41,46 +43,111 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Install JS deps
+      - name: Install dependencies
         run: npm ci
 
-      # Generates android/ folder (Expo prebuild)
+      # Generates android/ (since your repo is managed Expo)
       - name: Expo prebuild (Android)
         run: npx expo prebuild --platform android --non-interactive
 
-      # Recreate keystore file from secret
-      - name: Decode Android keystore
+      # Put the keystore where we'll reference it from credentials.json
+      - name: Decode keystore
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p android/app
           printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > android/app/upload-keystore.jks
-          ls -la android/app/upload-keystore.jks
+          test -s android/app/upload-keystore.jks
 
-      # Inject signing values into gradle.properties (no secrets committed)
-      - name: Write signing props
+      # Create credentials.json at repo root (this is what eas-build.gradle reads)
+      - name: Create credentials.json
         shell: bash
         run: |
+          set -euo pipefail
+          cat > credentials.json <<EOF
           {
-            echo "MYAPP_UPLOAD_STORE_FILE=upload-keystore.jks"
-            echo "MYAPP_UPLOAD_STORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
-            echo "MYAPP_UPLOAD_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}"
-            echo "MYAPP_UPLOAD_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}"
-          } >> android/gradle.properties
+            "android": {
+              "keystore": {
+                "keystorePath": "android/app/upload-keystore.jks",
+                "keystorePassword": "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
+                "keyAlias": "${{ secrets.ANDROID_KEY_ALIAS }}",
+                "keyPassword": "${{ secrets.ANDROID_KEY_PASSWORD }}"
+              }
+            }
+          }
+          EOF
 
-      # Build a directly installable APK
+      # Add the EAS signing integration file (matches Expo docs)
+      - name: Create android/app/eas-build.gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > android/app/eas-build.gradle <<'EOF'
+          // Build integration with EAS
+          import java.nio.file.Paths
+
+          android {
+            signingConfigs {
+              release { }
+            }
+            buildTypes {
+              release { }
+              debug { }
+            }
+          }
+
+          tasks.whenTaskAdded {
+            android.signingConfigs.release {
+              def credentialsJson = rootProject.file("../credentials.json");
+              def credentials = new groovy.json.JsonSlurper().parse(credentialsJson)
+              def keystorePath = Paths.get(credentials.android.keystore.keystorePath);
+              def storeFilePath = keystorePath.isAbsolute()
+                ? keystorePath
+                : rootProject.file("..").toPath().resolve(keystorePath);
+              storeFile storeFilePath.toFile()
+              storePassword credentials.android.keystore.keystorePassword
+              keyAlias credentials.android.keystore.keyAlias
+              if (credentials.android.keystore.containsKey("keyPassword")) {
+                keyPassword credentials.android.keystore.keyPassword
+              } else {
+                keyPassword credentials.android.keystore.keystorePassword
+              }
+            }
+            android.buildTypes.release {
+              signingConfig android.signingConfigs.release
+            }
+            android.buildTypes.debug {
+              signingConfig android.signingConfigs.release
+            }
+          }
+          EOF
+
+      # Ensure android/app/build.gradle applies eas-build.gradle
+      - name: Ensure build.gradle applies eas-build.gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="android/app/build.gradle"
+          if ! grep -q 'apply from: "./eas-build.gradle"' "$FILE"; then
+            echo '' >> "$FILE"
+            echo 'apply from: "./eas-build.gradle"' >> "$FILE"
+          fi
+
+      # Build a directly-installable APK
       - name: Build signed APK (Release)
         shell: bash
         run: |
+          set -euo pipefail
           cd android
-          ./gradlew --no-daemon assembleRelease
+          ./gradlew --no-daemon :app:assembleRelease
 
       - name: Locate APK
-        id: apk
+        id: out
         shell: bash
         run: |
-          APK_PATH="$(ls -1 app/build/outputs/apk/release/*release*.apk | head -n 1)"
-          echo "apk_path=android/${APK_PATH}" >> $GITHUB_OUTPUT
-          echo "Found APK: android/${APK_PATH}"
+          set -euo pipefail
+          APK_PATH="$(ls -1 android/app/build/outputs/apk/release/*release*.apk | head -n 1)"
+          echo "apk=$APK_PATH" >> $GITHUB_OUTPUT
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -89,26 +156,23 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      - name: Upload to private S3 and create presigned URL
+      - name: Upload to private S3 + presign URL
         shell: bash
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
         run: |
           set -euo pipefail
 
-          # Optional: customize the key layout per customer/app/version
           KEY="mobile-builds/${{ github.repository }}/${{ github.run_id }}/app-release.apk"
-
-          aws s3 cp "${{ steps.apk.outputs.apk_path }}" "s3://${S3_BUCKET}/${KEY}" \
+          aws s3 cp "${{ steps.out.outputs.apk }}" "s3://${S3_BUCKET}/${KEY}" \
             --content-type "application/vnd.android.package-archive"
 
-          # Presigned URL (AWS CLI max is 7 days = 604800 seconds)
-          EXPIRES="${{ inputs.expires_seconds }}"
-          if [ "$EXPIRES" -gt 604800 ]; then EXPIRES=604800; fi
+          EXPIRES="${{ inputs.expires_in }}"
+          if [ "$EXPIRES" -gt 604800 ]; then EXPIRES=604800; fi  # AWS CLI max 7 days
 
           URL="$(aws s3 presign "s3://${S3_BUCKET}/${KEY}" --expires-in "${EXPIRES}")"
 
-          echo "✅ Uploaded: s3://${S3_BUCKET}/${KEY}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ S3 Object: s3://${S3_BUCKET}/${KEY}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "🔗 Download (presigned):" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 Presigned download URL:" >> $GITHUB_STEP_SUMMARY
           echo "${URL}" >> $GITHUB_STEP_SUMMARY
