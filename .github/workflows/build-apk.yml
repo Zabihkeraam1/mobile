@@ -61,79 +61,53 @@ jobs:
           mkdir -p android/app
           printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > android/app/upload-keystore.jks
           test -s android/app/upload-keystore.jks
-
-      # Create credentials.json at repo root (this is what eas-build.gradle reads)
-      - name: Create credentials.json
+      - name: Write signing props (android/gradle.properties)
         shell: bash
         run: |
           set -euo pipefail
-          cat > credentials.json <<EOF
           {
-            "android": {
-              "keystore": {
-                "keystorePath": "android/app/upload-keystore.jks",
-                "keystorePassword": "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
-                "keyAlias": "${{ secrets.ANDROID_KEY_ALIAS }}",
-                "keyPassword": "${{ secrets.ANDROID_KEY_PASSWORD }}"
-              }
-            }
-          }
-          EOF
+            echo "MYAPP_UPLOAD_STORE_FILE=upload-keystore.jks"
+            echo "MYAPP_UPLOAD_STORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+            echo "MYAPP_UPLOAD_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}"
+            echo "MYAPP_UPLOAD_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}"
+          } >> android/gradle.properties
 
-      # Add the EAS signing integration file (matches Expo docs)
-      - name: Create android/app/eas-build.gradle
+      - name: Create android/app/signing.gradle
         shell: bash
         run: |
           set -euo pipefail
-          cat > android/app/eas-build.gradle <<'EOF'
-          // Build integration with EAS
-          import java.nio.file.Paths
-
+          cat > android/app/signing.gradle <<'EOF'
           android {
             signingConfigs {
-              release { }
-            }
-            buildTypes {
-              release { }
-              debug { }
-            }
-          }
-
-          tasks.whenTaskAdded {
-            android.signingConfigs.release {
-              def credentialsJson = rootProject.file("../credentials.json");
-              def credentials = new groovy.json.JsonSlurper().parse(credentialsJson)
-              def keystorePath = Paths.get(credentials.android.keystore.keystorePath);
-              def storeFilePath = keystorePath.isAbsolute()
-                ? keystorePath
-                : rootProject.file("..").toPath().resolve(keystorePath);
-              storeFile storeFilePath.toFile()
-              storePassword credentials.android.keystore.keystorePassword
-              keyAlias credentials.android.keystore.keyAlias
-              if (credentials.android.keystore.containsKey("keyPassword")) {
-                keyPassword credentials.android.keystore.keyPassword
-              } else {
-                keyPassword credentials.android.keystore.keystorePassword
+              release {
+                if (project.hasProperty("MYAPP_UPLOAD_STORE_FILE")) {
+                  storeFile file(MYAPP_UPLOAD_STORE_FILE)
+                  storePassword MYAPP_UPLOAD_STORE_PASSWORD
+                  keyAlias MYAPP_UPLOAD_KEY_ALIAS
+                  keyPassword MYAPP_UPLOAD_KEY_PASSWORD
+                }
               }
             }
-            android.buildTypes.release {
-              signingConfig android.signingConfigs.release
-            }
-            android.buildTypes.debug {
-              signingConfig android.signingConfigs.release
+
+            buildTypes {
+              release {
+                signingConfig signingConfigs.release
+              }
+              debug {
+                signingConfig signingConfigs.release
+              }
             }
           }
           EOF
 
-      # Ensure android/app/build.gradle applies eas-build.gradle
-      - name: Ensure build.gradle applies eas-build.gradle
+      - name: Ensure app/build.gradle applies signing.gradle
         shell: bash
         run: |
           set -euo pipefail
           FILE="android/app/build.gradle"
-          if ! grep -q 'apply from: "./eas-build.gradle"' "$FILE"; then
+          if ! grep -q 'apply from: "./signing.gradle"' "$FILE"; then
             echo '' >> "$FILE"
-            echo 'apply from: "./eas-build.gradle"' >> "$FILE"
+            echo 'apply from: "./signing.gradle"' >> "$FILE"
           fi
 
       # Build a directly-installable APK
